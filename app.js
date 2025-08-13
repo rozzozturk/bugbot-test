@@ -10,97 +10,122 @@ const app = express();
 const db = new sqlite3.Database(':memory:');
 
 app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 app.use(cookieParser());
 app.set('view engine', 'ejs');
 
-// Bellek sızıntısı için global array
-let memoryLeakArray = [];
+// Bellek sızıntısı için global obje
+const cartCache = {};
 
-// Basit kullanıcı tablosu
+// E-ticaret için örnek ürün ve kullanıcı tablosu
+// (daha gerçekçi bir yapı)
 db.serialize(() => {
-  db.run('CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT)');
-  db.run("INSERT INTO users (username, password) VALUES ('admin', 'admin123')");
+  db.run('CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, isAdmin INTEGER)');
+  db.run("INSERT INTO users (username, password, isAdmin) VALUES ('admin', 'admin123', 1)");
+  db.run("INSERT INTO users (username, password, isAdmin) VALUES ('user', 'user123', 0)");
+  db.run('CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, description TEXT)');
+  db.run("INSERT INTO products (name, price, description) VALUES ('Laptop', 1500, 'Güçlü bir laptop')");
+  db.run("INSERT INTO products (name, price, description) VALUES ('Mouse', 20, 'Kablosuz mouse')");
 });
 
-// SQL Injection Açığı
+// --- 1. Subtle SQL Injection ---
 app.post('/login', (req, res) => {
-  // KÖTÜ: Kullanıcı girdisi doğrudan SQL sorgusuna ekleniyor
-  const sql = `SELECT * FROM users WHERE username = '${req.body.username}' AND password = '${req.body.password}'`;
-  db.get(sql, (err, row) => {
-    if (row) {
-      res.cookie('auth', 'true');
-      res.send('Giriş başarılı!');
+  // Hata: Parametreli sorgu kullanılmıyor, input kısmen filtreleniyor ama yetersiz
+  const username = req.body.username?.replace(/[';]/g, ''); // Sadece tek tırnak ve noktalı virgül kaldırılıyor
+  const password = req.body.password;
+  const sql = `SELECT * FROM users WHERE username = '" + username + "' AND password = '" + password + "'`;
+  db.get(sql, (err, user) => {
+    if (user) {
+      res.cookie('session', user.id + ':' + (user.isAdmin ? 'admin' : 'user'), { httpOnly: true });
+      res.json({ success: true });
     } else {
-      res.send('Hatalı giriş!');
+      res.status(401).json({ error: 'Giriş başarısız' });
     }
   });
 });
 
-// XSS Açığı
-app.get('/greet', (req, res) => {
-  // KÖTÜ: Kullanıcı girdisi escape edilmeden HTML'e ekleniyor
-  res.send(`<h1>Merhaba, ${req.query.name}</h1>`);
+// --- 2. Subtle XSS ---
+app.get('/product/:id', (req, res) => {
+  // Hata: Ürün açıklaması doğrudan HTML'e ekleniyor, escape edilmiyor
+  db.get('SELECT * FROM products WHERE id = ?', [req.params.id], (err, product) => {
+    if (!product) return res.status(404).send('Ürün bulunamadı');
+    res.send(`<h2>${product.name}</h2><p>${product.description}</p>`); // description escape edilmiyor
+  });
 });
 
-// Kimlik Doğrulama Atlatma
-app.get('/admin', (req, res) => {
-  // KÖTÜ: Sadece bir cookie değerine bakılıyor, gerçek doğrulama yok
-  if (req.cookies.auth === 'true') {
-    res.send('Admin paneline hoş geldiniz!');
+// --- 3. Subtle Auth Bypass ---
+function isAuthenticated(req) {
+  // Hata: Sadece cookie'nin varlığına bakılıyor, içerik doğrulanmıyor
+  return req.cookies.session && req.cookies.session.split(':').length === 2;
+}
+function isAdmin(req) {
+  // Hata: Cookie'den admin olup olmadığına bakılıyor, manipülasyona açık
+  return req.cookies.session && req.cookies.session.split(':')[1] === 'admin';
+}
+app.get('/admin/dashboard', (req, res) => {
+  if (!isAuthenticated(req) || !isAdmin(req)) {
+    return res.status(403).send('Yetkisiz erişim');
+  }
+  res.send('Admin paneli!');
+});
+
+// --- 4. Subtle Input Validation ---
+app.post('/cart/add', (req, res) => {
+  // Hata: productId ve quantity için tip/güvenlik kontrolü yok
+  const { productId, quantity } = req.body;
+  if (!productId || !quantity) return res.status(400).send('Eksik parametre');
+  // Bellek sızıntısı için cartCache kullanılıyor
+  const userId = req.cookies.session?.split(':')[0];
+  if (!cartCache[userId]) cartCache[userId] = [];
+  cartCache[userId].push({ productId, quantity });
+  res.send('Ürün sepete eklendi');
+});
+
+// --- 5. Subtle Path Traversal ---
+app.get('/download', (req, res) => {
+  // Hata: Dosya adı filtrelenmiyor, path.join ile dizin atlaması engellenmiyor
+  const file = req.query.file;
+  const filePath = path.join(__dirname, 'downloads', file);
+  res.download(filePath);
+});
+
+// --- 6. Subtle Async/Await Error Handling ---
+app.get('/order/:id', async (req, res) => {
+  // Hata: try/catch yok, db.get callback ile kullanılıyor, await yanlış yerde
+  let order;
+  await db.get('SELECT * FROM orders WHERE id = ?', [req.params.id], (err, row) => {
+    order = row;
+  });
+  if (!order) return res.status(404).send('Sipariş bulunamadı');
+  res.json(order);
+});
+
+// --- 7. Subtle Memory Leak ---
+app.post('/cart/checkout', (req, res) => {
+  // Hata: Sepet temizlenmiyor, cartCache sürekli büyüyor
+  const userId = req.cookies.session?.split(':')[0];
+  if (cartCache[userId]) {
+    // Sipariş işlemleri...
+    res.send('Sipariş alındı!');
+    // cartCache[userId] = []; // Unutulmuş!
   } else {
-    res.send('Yetkisiz!');
+    res.status(400).send('Sepet boş');
   }
 });
 
-// Bellek Sızıntısı
-app.get('/leak', (req, res) => {
-  // KÖTÜ: Her istekle diziye veri ekleniyor, asla temizlenmiyor
-  memoryLeakArray.push(new Array(1e6).fill('leak'));
-  res.send('Bellek sızdırıldı!');
-});
-
-// Yarış Durumu (Race Condition)
-let raceValue = 0;
-app.get('/race', (req, res) => {
-  // KÖTÜ: Aynı anda birden fazla istek raceValue'yu güncelleyebilir
-  const oldValue = raceValue;
-  setTimeout(() => {
-    raceValue = oldValue + 1;
-    res.send(`raceValue: ${raceValue}`);
-  }, 100);
-});
-
-// Async/Await Hatalı Kullanımı
-app.get('/async', async (req, res) => {
-  // KÖTÜ: await eksik, hata yakalanmıyor
-  let result;
-  try {
-    result = await db.get('SELECT 1'); // sqlite3 get fonksiyonu promise döndürmez!
-  } catch (e) {
-    // Hata asla yakalanmaz
+// --- 8. Subtle Race Condition ---
+let stock = 10;
+app.post('/buy', (req, res) => {
+  // Hata: Stok kontrolü ve güncellemesi atomik değil
+  const { productId, quantity } = req.body;
+  if (stock >= quantity) {
+    setTimeout(() => {
+      stock -= quantity;
+      res.send('Satın alma başarılı');
+    }, Math.random() * 100);
+  } else {
+    res.status(400).send('Yetersiz stok');
   }
-  res.send('Async hata örneği!');
-});
-
-// Girdi Doğrulama Eksikliği
-app.post('/echo', (req, res) => {
-  // KÖTÜ: Girdi doğrulaması yok, her şeyi geri döndürüyor
-  res.send(`Girdi: ${req.body.input}`);
-});
-
-// Path Traversal Açığı
-app.get('/file', (req, res) => {
-  // KÖTÜ: Kullanıcıdan gelen yol doğrudan dosya sistemine aktarılıyor
-  const filePath = path.join(__dirname, req.query.path);
-  res.sendFile(filePath);
-});
-
-// Prototype Pollution Açığı
-app.post('/pollute', (req, res) => {
-  // KÖTÜ: Lodash merge ile kontrolsüz nesne birleştirme
-  let obj = {};
-  _.merge(obj, req.body);
-  res.send('Prototype pollution denendi!');
 });
 
 app.listen(3000, () => {
